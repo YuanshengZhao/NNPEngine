@@ -899,11 +899,12 @@ void SQD::dump(const char *fname, bool append)
 RMDF::RMDF(int nexp, char **fexp, SQ *c_sq, numtype strength, numtype _gamma, LJTableCoulDSF *pair, NNPOTENTIAL_TBL *pair_nnp):
 potmx(nullptr)
 {
-    if(_gamma==1) std::cerr<<"DA/RMD\n";
-    else if (_gamma>0 && _gamma<1)  std::cerr<<"FMIRL training\n";
-    else if (_gamma==0)  std::cerr<<"FMIRL inference\n";
+    if(_gamma==1) std::cerr<<"DA/RMD; ";
+    else if (_gamma>0 && _gamma<1)  std::cerr<<"FMIRL training; ";
+    else if (_gamma==0)  std::cerr<<"FMIRL inference; ";
     else END_PROGRAM("invalid gamma");
-    
+    std::cerr<<"strength = "<<strength<<"\n";
+
     n_sq=nexp;
     gamma=_gamma;
     GR *c_gr=c_sq->gr;

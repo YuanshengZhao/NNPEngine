@@ -16,7 +16,8 @@ int main(int argc, const char *argv[])
     random_set_seed();
 
     if(!strcmp(argv[1],"classical")) return classical(argc-1,argv+1);
-    if(!strcmp(argv[1],"nnp_train")) return nnp_train(argc-1,argv+1);
+    if(!strcmp(argv[1],"nnp_train_variableBL")) return nnp_train_variableBL(argc-1,argv+1);
+    if(!strcmp(argv[1],"nnp_train_fixedBL")) return nnp_train_fixedBL(argc-1,argv+1);
     if(!strcmp(argv[1],"nnp_run")) return nnp_run(argc-1,argv+1);
 
     END_PROGRAM("unknown arg");

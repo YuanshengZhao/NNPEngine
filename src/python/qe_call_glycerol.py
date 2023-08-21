@@ -87,45 +87,65 @@ def save_qe():
 def load_npz(fname):
     with np.load(fname) as fp:
         return fp["x"],fp["e"],fp["f"]
-def npz2bin(fname, skip_exist=False):
-    if skip_exist and os.path.isfile(fname+".bin"): return
+def npz2bin(fname, offset=0, skip_exist=False):
+    if skip_exist and (offset==0) and os.path.isfile(fname+".bin"): return
     with np.load(fname) as fp:
-        x,e,f = fp["x"].reshape([-1]),fp["e"],fp["f"].reshape([-1])
+        x,e,f = fp["x"].reshape([-1]),fp["e"]+offset,fp["f"].reshape([-1])
     with open(fname+".bin", "wb") as fp:
         fp.write(struct.pack('f'*len(x), *x))
         fp.write(struct.pack('d', e)) # energy is stored as double to avoid precesion loss
         fp.write(struct.pack('f'*len(f), *f))
+    assert len(x)==len(f) and len(x)==3*NMOL*NATM
+    # print(fname,len(x),len(f))
 
     
 
 if __name__=="__main__":
-    with open(sys.argv[1],"r") as fp:
-        if int(fp.readline())!=NMOL*NATM: raise RuntimeError("wrong num atoms")
-        lns=fp.readline().split()
-        BL=np.round(float(lns[-1])-float(lns[-2]),4)
-        for _ in range(NMOL*NATM):
-            lns=fp.readline().split()
-            cod.append([float(xxx) for xxx in lns[-3:]])
-    cod=np.array(cod)
+    BL=np.round(float(sys.argv[1].split("_")[-2]),4)
 
-    qe_run()
-    save_qe()
+    if len(sys.argv)>=3:
+        if sys.argv[2]!="--no-qe": raise RuntimeError("bad argv")
+    else:
+        with open(sys.argv[1],"r") as fp:
+            if int(fp.readline())!=NMOL*NATM: raise RuntimeError("wrong num atoms")
+            lns=fp.readline().split()
+            if BL!=np.round(float(lns[-1])-float(lns[-2]),4): raise RuntimeError("BL not match")
+            for _ in range(NMOL*NATM):
+                lns=fp.readline().split()
+                cod.append([float(xxx) for xxx in lns[-3:]])
+        cod=np.array(cod)
+        
+        qe_run()
+        save_qe()
+
+    els=[]
+    flst=glob.glob("/mnt/ntfs2/glycerol_nnp/aimd/train_data/qe_*_*.npz")
+    for f in flst:
+        with np.load(f) as npz:
+            els.append(npz["e"])
+    emean=-np.mean(els)
+    print(emean)
+
+    for fn in flst:
+        npz2bin(fn,offset=emean)
 
     flst=glob.glob("/mnt/ntfs2/glycerol_nnp/aimd/train_data/qe_%f*.npz"%(BL))
     tms=[float(xx.split("_")[-1][:-4]) for xx in flst]
     flst=np.array(flst)[np.argsort(tms)]
-
-    for fn in flst:
-        npz2bin(fn,True)
     
     ll=len(flst)
-    lt=max(int(ll*.9),1)
-    le=max(ll-lt,1)
+    ll-=(ll%10)
+    fl1=flst[:ll].reshape([-1,10])
+    fl2=flst[ll:]
+    f_train=np.concatenate((fl1[:,:-1].reshape(-1),fl2))
+    f_eval=fl1[:,-1].reshape(-1)
+    if len(f_eval)==0: f_eval=f_train[-1:]
+
     with open("/mnt/ntfs2/glycerol_nnp/nnp_data/list_300_%.4f.txt"%(BL),"w") as fp:
-        fp.write(str(lt)+"\n")
-        for fn in flst[:lt]:
+        fp.write(str(len(f_train))+"\n")
+        for fn in f_train:
             fp.write(fn+".bin\n")
     with open("/mnt/ntfs2/glycerol_nnp/nnp_data/listeval_300_%.4f.txt"%(BL),"w") as fp:
-        fp.write(str(le)+"\n")
-        for fn in flst[-le:]:
+        fp.write(str(len(f_eval))+"\n")
+        for fn in f_eval:
             fp.write(fn+".bin\n")

@@ -19,7 +19,7 @@
 #include <omp.h>
 #endif
 
-#define BIN_NEIGH 1024
+#define BIN_NEIGH 8192
 #define THERMO_ANDERSEN_FRAC 0.1
 
 /*
@@ -387,7 +387,7 @@ int classical(int argc, const char *argv[])
                             <<std::setw(10)<<list_pair.nbuild
                             // <<std::setw(18)<<(erg+ekin+erg_exp)
                             // <<std::setw(18)<<(erg+ekin)
-                            <<"\n"; 
+                            <<std::endl; 
                 }
             }
         }
@@ -456,7 +456,7 @@ int classical(int argc, const char *argv[])
     return 0;
 }
 
-int nnp_train(int argc, const char *argv[])
+int nnp_train_fixedBL(int argc, const char *argv[])
 {
     if(argc!=2) END_PROGRAM("invalid arg");
 
@@ -592,7 +592,8 @@ int nnp_train(int argc, const char *argv[])
                     }
                     else
                     {
-                        erg_true_mean+=nnp.load_data(nnp.fnames_shuffled[idat]);
+                        erg_true_mean+=(erg_true=nnp.load_data(nnp.fnames_shuffled[idat]));
+                        erg_true*=nnp.ry_kcal_mol;
                     }
                     // printMatrix(ENVIRON::f_mol,14,3,"f",'p');
                 }
@@ -663,8 +664,286 @@ int nnp_train(int argc, const char *argv[])
             #pragma omp single
             {
                 loss/=(n_dat*ENVIRON::natom);
-                std::cout<<"iter "<<nnp.n_update<<": loss = "<<(loss)<<"\n";
-                if(epoch) fwrite(&loss,sizeof(float),1,fp_los);
+                std::cout<<"epoch "<<(epoch+1)<<" iter "<<nnp.n_update<<": loss = "<<loss<<std::endl; 
+                fwrite(&loss,sizeof(float),1,fp_los);
+            }
+        }
+    }
+
+    fclose(fp_los);
+    fclose(fp_erg);
+    fclose(fp_frc);
+
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%s",str_buf2) != 1) END_PROGRAM("read error");
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%s",str_buf3) != 1) END_PROGRAM("read error");
+    std::cerr<<"WGT: "<<str_buf2<<"\n";
+    std::cerr<<"OPT: "<<str_buf3<<"\n";
+    nnp.save_wts(str_buf2,str_buf3);
+
+    return 0;
+}
+
+int** BL_MANAGER::setBL(numtype bl)
+{
+    ENVIRON::set_bl(bl);
+    ENVIRON::t_rdx=ENVIRON::NUM_X/ENVIRON::bl;
+    ENVIRON::t_rdy=ENVIRON::NUM_Y/ENVIRON::bl;
+    ENVIRON::t_rdz=ENVIRON::NUM_Z/ENVIRON::bl;
+
+    ENVIRON::g_rdx=1/(ENVIRON::g_dx=grid_length);
+    ENVIRON::g_offset=ghost_cutof+ENVIRON::h_bl;
+    ENVIRON::num_gx=std::ceil((ENVIRON::g_offset*2)*ENVIRON::g_rdx);
+    ENVIRON::num_grid=ENVIRON::ENVIRON::num_gx*(ENVIRON::num_gxsq=ENVIRON::num_gx*ENVIRON::num_gx);
+    ENVIRON::num_gxm1=ENVIRON::num_gx-1;
+
+    LOCAL::set_ghost_lim(ghost_cutof);
+
+    // search lists return if found
+    for(int i=0;i<lst_capa;++i)
+    {
+        if(bls[i]==bl) return lists[i];
+    }
+
+    int **ret=nullptr;
+    bls[cur_lst]=bl;
+    lists[cur_lst]=ret=NEIGHLIST::build_bin_list(blst_cutof,126);
+    //deque like list
+    if(++cur_lst>=lst_capa) cur_lst=0;
+    return ret;
+}
+
+BL_MANAGER::BL_MANAGER(numtype gl,numtype gc,numtype bc):
+cur_lst(0), lists{0}, bls{0}
+{
+    grid_length=gl;
+    ghost_cutof=gc;
+    blst_cutof=bc;
+}
+
+BL_MANAGER::~BL_MANAGER()
+{
+    for(int i=0;i<lst_capa;++i)
+    {
+        if(lists[i]) destroy2DArray(lists[i]);
+    }
+}
+
+// ..._16.383300_1680017213.npz.bin
+// number between last 2 _
+numtype getBLfromFname(const char* fname)
+{
+    int i1=0,i2=0;
+    char c;
+    for(int i=0;(c=fname[i]);++i)
+    {
+        if(c=='_')
+        {
+            i1=i2;
+            i2=i;
+        }
+    }
+    numtype bll;
+    sscanf(fname+i1+1,FMT_NUMTYPE,&bll);
+    // std::cerr<<bll<<" "<<fname<<"\n";
+    return bll;
+}
+
+// Note: largest bl must be used in the initialization stage, or index overflow will happen
+int nnp_train_variableBL(int argc, const char *argv[])
+{
+    if(argc!=2) END_PROGRAM("invalid arg");
+
+    char file_buf[SZ_FBF],str_buf[SZ_FBF],str_buf2[SZ_FBF],str_buf3[SZ_FBF];
+    FILE *fp=fopen(argv[1],"r");
+    int tpint,tpint2,tpint3,tpint4;
+
+    std::cerr<<"NUM_THREAD = "<<ENVIRON::NUM_THREAD<<"\n";
+
+    // initialization 
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%s",str_buf) != 1) END_PROGRAM("read error");
+    ENVIRON::initialize(str_buf);
+
+    // setup cutoff & potential
+    numtype pair_cutoff=8.,skin=0;
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,FMT_NUMTYPE " ", &pair_cutoff) != 1) END_PROGRAM("read error");
+    std::cerr<<"cutoff "<<pair_cutoff<<" skin "<<skin<<"\n";
+    const numtype comm_cutoff=skin+pair_cutoff;
+
+    LOCAL::set_ghost_lim(comm_cutoff);
+    ENVIRON::init_grid(0.5F*comm_cutoff,comm_cutoff);
+
+    BL_MANAGER bl_manager(0.5F*comm_cutoff,comm_cutoff,comm_cutoff);
+    int **bin_list_pair;
+
+    //compute n_bounds
+    MOLECULE *imol;
+    tpint2=tpint3=tpint4=0;
+    for(int im=0;im<ENVIRON::nmol;++im)
+    {   
+        imol=ENVIRON::moltype+ENVIRON::mol_type[im];
+        tpint2+= imol->n_bond;
+        tpint3+= imol->n_angle;
+        tpint4+= imol->n_dihedral;
+    }
+
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%d",&tpint)!=1)  END_PROGRAM("read error");
+    BOND bond(tpint,tpint2);
+    bond.autoGenerate();
+
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%d",&tpint)!=1)  END_PROGRAM("read error");
+    ANGLE angle(tpint,tpint3);
+    angle.autoGenerate();
+
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%d",&tpint)!=1)  END_PROGRAM("read error");
+    DIHEDRAL dihedral(tpint,tpint4);
+    dihedral.autoGenerate();
+
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%s",str_buf) != 1) END_PROGRAM("read error");
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%s",str_buf2) != 1) END_PROGRAM("read error");
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%s",str_buf3) != 1) END_PROGRAM("read error");
+    std::cerr<<"NNP: "<<str_buf<<"\n";
+    std::cerr<<"WGT: "<<str_buf2<<"\n";
+    std::cerr<<"OPT: "<<str_buf3<<"\n";
+    NNP_TRAIN_TF nnp(str_buf,str_buf2,str_buf3,pair_cutoff,&bond,&angle,&dihedral);
+
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%s",str_buf) != 1) END_PROGRAM("read error");
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%s",str_buf2) != 1) END_PROGRAM("read error");
+    std::cerr<<"DAT: "<<str_buf<<"\n";
+    int n_dat=nnp.load_train_info(str_buf,str_buf2);
+
+    float erg_true=0, loss=0, lr0, lr, alpha;
+    int num_epochs;
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%f %f %f %d",&lr0,&lr,&alpha,&num_epochs) != 4) END_PROGRAM("read error");
+    std::cerr<<"lr = "<<lr0<<" | "<<lr<<"; alpha = "<<alpha<<"\n"<<"epochs = "<<num_epochs<<"\n";
+
+    *(float*)nnp.tfcall->inputs[nnp.n_wts+13]=alpha/ENVIRON::natom;
+
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%s",str_buf) != 1) END_PROGRAM("read error");
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%s",str_buf2) != 1) END_PROGRAM("read error");
+    fgets_non_empty(fp,file_buf); string_get_env(file_buf);
+    if(sscanf(file_buf,"%s",str_buf3) != 1) END_PROGRAM("read error");
+    std::cerr<<"LOS: "<<str_buf<<"\n";
+    std::cerr<<"ERG: "<<str_buf2<<"\n";
+    std::cerr<<"FRC: "<<str_buf3<<"\n";
+    FILE *fp_erg,*fp_frc,*fp_los=fopen(str_buf,"ab");
+
+
+    #pragma omp parallel num_threads(ENVIRON::NUM_THREAD)
+    {
+        if(omp_get_num_threads()!=ENVIRON::NUM_THREAD) END_PROGRAM("omp failed to start");
+        int comm_me=omp_get_thread_num();
+        LOCAL local(comm_me);
+
+        NEIGHLIST list_pair(comm_me,pair_cutoff,skin,NEIGH_SZ,nullptr);
+        // init force
+        #pragma omp barrier
+        for(int epoch=0; epoch<num_epochs;++epoch)
+        {
+            #pragma omp single
+            {
+                if(epoch==1)
+                    lr0=lr;
+                if(epoch==num_epochs-1)
+                {
+                    fp_erg=fopen(str_buf2,"wb");
+                    fp_frc=fopen(str_buf3,"wb");
+                }
+                loss=0;
+                shuffle(nnp.fnames_shuffled,n_dat);
+            }
+            for(int idat=0; idat<n_dat; ++idat)
+            {
+                #pragma omp single
+                {
+                    ENVIRON::unsort();
+                    bin_list_pair=bl_manager.setBL(getBLfromFname(nnp.fnames_shuffled[idat]));
+                    *(numtype*)nnp.tfcall->inputs[nnp.n_wts+10]=ENVIRON::bl;
+                    erg_true=nnp.ry_kcal_mol*(nnp.load_data(nnp.fnames_shuffled[idat]));
+                }
+                list_pair.bin_list=bin_list_pair;
+                local.refold_and_tag();               
+                #pragma omp barrier
+                #pragma omp single
+                {
+                    ENVIRON::sort();
+                }
+                local.generate_ghost();
+                #pragma omp barrier
+                #pragma omp single
+                {
+                    ENVIRON::tidyup_ghost();
+                }
+                local.update_ghost_pos<true>();
+                #pragma omp barrier
+                #pragma omp single
+                {
+                    ENVIRON::sort_ghost();
+                }
+                local.update_ghost_and_info();
+                #pragma omp barrier
+                nnp.num_neigh_local[comm_me]=list_pair.build<true>();
+                #pragma omp barrier
+                #pragma omp single
+                {
+                    nnp.allocate_neilist();
+                }
+                nnp.gather_neilist(&list_pair);
+#ifndef NNP_USE_X_MOL
+                #pragma omp barrier
+                nnp.update_intra(comm_me,&bond,&angle,&dihedral);
+#endif
+                #pragma omp barrier
+                #pragma omp single
+                {
+                    loss+=nnp.nnEval(erg_true);
+                    if(epoch==num_epochs-1)
+                    {
+                        fwrite(&erg_true,sizeof(float),1,fp_erg);
+                        fwrite(*(nnp.tfcall->outputs+(nnp.n_output-2)),sizeof(float),1,fp_erg);
+                        if(idat%100 == 0)
+                        {
+                            fwrite(*(nnp.tfcall->inputs+(nnp.n_input-3)),sizeof(float),ENVIRON::natom*3,fp_frc);
+                            fwrite(*(nnp.tfcall->outputs+(nnp.n_output-1)),sizeof(float),ENVIRON::natom*3,fp_frc);
+                        }
+                    }
+                }
+                nnp.apply_gradient(lr0,comm_me);
+                #pragma omp barrier
+                #pragma omp single
+                {
+                    // for(int jj=nnp.n_wts;jj<nnp.n_wts+8;++jj)
+                    // {
+                    //     std::cerr<<jj<<" "<<nnp.sz_in[jj]<<" -> ";
+                    //     for(int kk=0;kk<20;++kk)
+                    //         std::cerr<<((int*)nnp.tfcall->inputs[jj])[kk]<<" ";
+                    //     std::cerr<<"\n";
+                    // }
+                    // for(int jj=0;jj<28;++jj) std::cerr<<ENVIRON::atom_id[jj]<<" ";
+                    // for(int jj=0;jj<28;++jj) std::cerr<<nnp.inv_atom_id[jj]<<" ";
+                    // std::cerr<<**(nnp.tfcall->outputs+(nnp.n_output-2))<<" "<<loss<<"\n";
+                    nnp.tfcall->clearOutput();
+                }
+            }
+            #pragma omp single
+            {
+                loss/=(n_dat*ENVIRON::natom);
+                std::cout<<"epoch "<<(epoch+1)<<" iter "<<nnp.n_update<<": loss = "<<loss<<std::endl;
+                fwrite(&loss,sizeof(float),1,fp_los);
             }
         }
     }
@@ -1068,7 +1347,7 @@ int nnp_run(int argc, const char *argv[])
                             <<std::setw(18)<<erg_exp
                             <<std::setw(10)<<list_pair.nbuild
                             // <<std::setw(18)<<(erg+ekin)
-                            <<"\n"; 
+                            <<std::endl; 
                 }
             }
         }
